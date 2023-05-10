@@ -158,6 +158,10 @@ type RequestVoteReply struct {
 	To      int
 }
 
+type AppendEntriesArgs struct{}
+
+type AppendEntriesReply struct{}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
