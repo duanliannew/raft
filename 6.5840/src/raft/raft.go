@@ -158,9 +158,15 @@ type RequestVoteReply struct {
 	To      int
 }
 
-type AppendEntriesArgs struct{}
+type AppendEntriesArgs struct {
+	Term   int
+	Leader int
+}
 
-type AppendEntriesReply struct{}
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
@@ -217,6 +223,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	if reply != nil {
+		reply.Term = rf.term
+		reply.Success = true
+	}
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -262,9 +282,7 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
-		rf.mu.Lock()
 		if rf.state == Candidate || rf.state == Follower {
-			rf.mu.Unlock()
 			// pause for a random amount of time between 50 and 350
 			// milliseconds.
 			ms := 50 + (rand.Int63() % 300)
@@ -317,18 +335,32 @@ func (rf *Raft) ticker() {
 			}
 			rf.mu.Unlock()
 		} else {
-			rf.mu.Unlock()
-			ms := 25
-			time.Sleep(time.Duration(ms) * time.Millisecond)
-
-			rf.mu.Lock()
 			// Send Heartbeat to other peers
+			rf.mu.Lock()
+			heartBeat := AppendEntriesArgs{
+				Term:   rf.term,
+				Leader: rf.me,
+			}
 			for i := range rf.peers {
 				if i != rf.me {
-					go func(peer int) {}(i)
+					go func(peer int, hb *AppendEntriesArgs) {
+						var heartBeatAck AppendEntriesReply
+						if rf.sendAppendEntries(peer, &heartBeat, &heartBeatAck) {
+							rf.mu.Lock()
+							if heartBeatAck.Term > rf.term {
+								rf.term = heartBeatAck.Term
+								rf.state = Follower
+							}
+							rf.mu.Unlock()
+						}
+					}(i, &heartBeat)
 				}
 			}
 			rf.mu.Unlock()
+
+			// Sleep for a while before send another heart beat to establish authority
+			ms := 25
+			time.Sleep(time.Duration(ms) * time.Millisecond)
 		}
 	}
 }
