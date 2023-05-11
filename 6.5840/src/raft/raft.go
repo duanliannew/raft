@@ -72,7 +72,7 @@ type Raft struct {
 	votedFor int
 	votes    map[int]RequestVoteReply
 
-	heartBeated int32
+	leaderAlive bool
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -229,8 +229,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.term = args.Term
 		rf.state = Follower
 		rf.votedFor = -1
-		rf.votes = map[int]RequestVoteReply{}
-		atomic.StoreInt32(&rf.heartBeated, 1)
+		rf.votes = make(map[int]RequestVoteReply)
+		rf.leaderAlive = true
 		// fmt.Println(time.Now(), "Leader", args.Leader, "send heartbeat to", rf.me)
 		if reply != nil {
 			reply.Term = rf.term
@@ -298,10 +298,13 @@ OUTER:
 		// Your code here (2A)
 		rf.mu.Lock()
 		if rf.state == Candidate || rf.state == Follower {
-			rf.mu.Unlock()
-
-			if atomic.LoadInt32(&rf.heartBeated) == 0 {
-				rf.mu.Lock()
+			if rf.leaderAlive {
+				rf.leaderAlive = false
+				rf.mu.Unlock()
+				ms := 50 + (rand.Int63() % 300)
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+			} else {
+				fmt.Printf("Peer %d switch from %d to %d with new term %d\n", rf.me, rf.state, Candidate, rf.term+1)
 				rf.state = Candidate
 				rf.term++
 				rf.votedFor = rf.me
@@ -330,7 +333,7 @@ OUTER:
 									rf.term = reply.Term
 									rf.state = Follower
 									rf.votedFor = -1
-									rf.votes = map[int]RequestVoteReply{}
+									rf.votes = make(map[int]RequestVoteReply)
 								} else if reply.Term == rf.term {
 									rf.votes[s] = reply
 									grantedVotes := 0
@@ -356,12 +359,12 @@ OUTER:
 				for ; i < 10; i++ {
 					rf.mu.Lock()
 					if rf.state == Leader {
-						atomic.StoreInt32(&rf.heartBeated, 1)
+						rf.leaderAlive = true
 						rf.mu.Unlock()
 						goto OUTER
 					}
 
-					if atomic.LoadInt32(&rf.heartBeated) == 1 {
+					if rf.leaderAlive {
 						rf.mu.Unlock()
 						break
 					}
@@ -370,13 +373,10 @@ OUTER:
 					ms := 5
 					time.Sleep(time.Duration(ms) * time.Millisecond)
 				}
-
-				atomic.StoreInt32(&rf.heartBeated, 0)
+				rf.mu.Lock()
+				rf.leaderAlive = false
+				rf.mu.Unlock()
 				ms := (10-int64(i))*5 + (rand.Int63() % 300)
-				time.Sleep(time.Duration(ms) * time.Millisecond)
-			} else {
-				atomic.StoreInt32(&rf.heartBeated, 0)
-				ms := 50 + (rand.Int63() % 300)
 				time.Sleep(time.Duration(ms) * time.Millisecond)
 			}
 		} else {
@@ -412,7 +412,9 @@ OUTER:
 				rf.mu.Unlock()
 				if follower {
 					fmt.Println("Switch from leader to follower", rf.me)
-					atomic.StoreInt32(&rf.heartBeated, 0)
+					rf.mu.Lock()
+					rf.leaderAlive = false
+					rf.mu.Unlock()
 					ms := (10-int64(i))*5 + (rand.Int63() % 300)
 					time.Sleep(time.Duration(ms) * time.Millisecond)
 					break
@@ -445,7 +447,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.term = 0
 	rf.votedFor = -1
 	rf.votes = make(map[int]RequestVoteReply)
-	atomic.StoreInt32(&rf.heartBeated, 1)
+
+	// 初始化时假设有一个 leader
+	rf.leaderAlive = true
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
