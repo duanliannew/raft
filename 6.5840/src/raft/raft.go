@@ -72,7 +72,7 @@ type Raft struct {
 	votedFor int
 	votes    map[int]RequestVoteReply
 
-	heartBeat bool
+	heartBeated int32
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -173,7 +173,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	granted := args.Term > rf.term || (args.Term == rf.term && (rf.votedFor == -1 || rf.votedFor == args.From))
-	fmt.Println("peer", rf.me, "current term", rf.term, "state", rf.state, "receive RequestVote from", args.From, ",term", args.Term, ", to", args.To)
+	fmt.Println(time.Now(), "peer", rf.me, "current term", rf.term, "state", rf.state, "receive RequestVote from", args.From, ",term", args.Term)
 
 	if args.Term > rf.term {
 		rf.term = args.Term
@@ -225,9 +225,22 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	if reply != nil {
-		reply.Term = rf.term
-		reply.Success = true
+	if args.Term >= rf.term {
+		rf.term = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.votes = map[int]RequestVoteReply{}
+		atomic.StoreInt32(&rf.heartBeated, 1)
+		fmt.Println(time.Now(), "Leader", args.Leader, "send heartbeat to", rf.me)
+		if reply != nil {
+			reply.Term = rf.term
+			reply.Success = true
+		}
+	} else {
+		if reply != nil {
+			reply.Term = rf.term
+			reply.Success = false
+		}
 	}
 	rf.mu.Unlock()
 }
@@ -271,6 +284,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	fmt.Println("Kill peer", rf.me)
 }
 
 func (rf *Raft) killed() bool {
@@ -279,17 +293,27 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
+	init := true
+OUTER:
 	for !rf.killed() {
 		// Your code here (2A)
-		// Check if a leader election should be started.
+		rf.mu.Lock()
 		if rf.state == Candidate || rf.state == Follower {
+			rf.mu.Unlock()
 			// pause for a random amount of time between 50 and 350
-			// milliseconds.
-			ms := 50 + (rand.Int63() % 300)
-			time.Sleep(time.Duration(ms) * time.Millisecond)
+			// milliseconds. if timeout, check if there is leader and/or new term
+			// 等待 election timeout 的关键点在于:
+			// 1. 其它节点发送的心跳(term 不能过期)
+			// 2. 自己已经当选 (不应该出现这种情况，如果自己当选了，就不能在这里等超时，而是立即退出来，周期性地发送心跳)
+			// fmt.Println(time.Now(), "peer initialize", rf.me)
+			if init {
+				ms := 50 + (rand.Int63() % 300)
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+				init = false
+			}
 
-			rf.mu.Lock()
-			if rf.state == Candidate || rf.state == Follower {
+			if atomic.LoadInt32(&rf.heartBeated) == 0 {
+				rf.mu.Lock()
 				rf.state = Candidate
 				rf.term++
 				rf.votedFor = rf.me
@@ -309,34 +333,66 @@ func (rf *Raft) ticker() {
 							To:   i,
 						}
 
-						go func(s int, arg *RequestVoteArgs) {
+						go func(s int, args *RequestVoteArgs) {
 							var reply RequestVoteReply
-							if rf.sendRequestVote(s, &request, &reply) {
+							if rf.sendRequestVote(s, args, &reply) {
 								rf.mu.Lock()
-								fmt.Println("peer", rf.me, "send RequestVote to", arg.To, ", term:", arg.Term)
-								rf.votes[s] = reply
-								grantedVotes := 0
-								for _, v := range rf.votes {
-									if v.Granted {
-										fmt.Println("grant votes from:", v.From, ",term:", v.Term, ", peers_number:", len(rf.peers))
-										grantedVotes++
+								fmt.Println("peer", rf.me, "send RequestVote to", args.To, ", term:", args.Term)
+								if reply.Term > rf.term {
+									rf.term = reply.Term
+									rf.state = Follower
+									rf.votedFor = -1
+									rf.votes = map[int]RequestVoteReply{}
+								} else if reply.Term == rf.term {
+									rf.votes[s] = reply
+									grantedVotes := 0
+									for _, v := range rf.votes {
+										if v.Granted && v.Term == rf.term {
+											fmt.Println("grant votes from:", v.From, ",term:", v.Term, ", peers_number:", len(rf.peers))
+											grantedVotes++
+										}
 									}
-								}
 
-								if (2 * grantedVotes) > len(rf.peers) {
-									fmt.Println("peer", rf.me, "becomes leader of term", rf.term)
-									rf.state = Leader
+									if (2 * grantedVotes) > len(rf.peers) {
+										fmt.Println("peer", rf.me, "becomes leader of term", rf.term)
+										rf.state = Leader
+									}
 								}
 								rf.mu.Unlock()
 							}
 						}(i, &request)
 					}
 				}
+				rf.mu.Unlock()
+				i := 0
+				for ; i < 10; i++ {
+					rf.mu.Lock()
+					if rf.state == Leader {
+						atomic.StoreInt32(&rf.heartBeated, 1)
+						rf.mu.Unlock()
+						goto OUTER
+					}
+
+					if atomic.LoadInt32(&rf.heartBeated) == 1 {
+						rf.mu.Unlock()
+						break
+					}
+
+					rf.mu.Unlock()
+					ms := 5
+					time.Sleep(time.Duration(ms) * time.Millisecond)
+				}
+
+				atomic.StoreInt32(&rf.heartBeated, 0)
+				ms := (10-int64(i))*5 + (rand.Int63() % 300)
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+			} else {
+				atomic.StoreInt32(&rf.heartBeated, 0)
+				ms := 50 + (rand.Int63() % 300)
+				time.Sleep(time.Duration(ms) * time.Millisecond)
 			}
-			rf.mu.Unlock()
 		} else {
 			// Send Heartbeat to other peers
-			rf.mu.Lock()
 			heartBeat := AppendEntriesArgs{
 				Term:   rf.term,
 				Leader: rf.me,
@@ -345,7 +401,7 @@ func (rf *Raft) ticker() {
 				if i != rf.me {
 					go func(peer int, hb *AppendEntriesArgs) {
 						var heartBeatAck AppendEntriesReply
-						if rf.sendAppendEntries(peer, &heartBeat, &heartBeatAck) {
+						if rf.sendAppendEntries(peer, hb, &heartBeatAck) {
 							rf.mu.Lock()
 							if heartBeatAck.Term > rf.term {
 								rf.term = heartBeatAck.Term
@@ -359,10 +415,24 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 			// Sleep for a while before send another heart beat to establish authority
-			ms := 25
-			time.Sleep(time.Duration(ms) * time.Millisecond)
+			follower := false
+			for i := 0; i < 5; i++ {
+				ms := 5
+				time.Sleep(time.Duration(ms) * time.Millisecond)
+				rf.mu.Lock()
+				follower = (rf.state == Follower)
+				rf.mu.Unlock()
+				if follower {
+					fmt.Println("Switch from leader to follower", rf.me)
+					atomic.StoreInt32(&rf.heartBeated, 0)
+					ms := (10-int64(i))*5 + (rand.Int63() % 300)
+					time.Sleep(time.Duration(ms) * time.Millisecond)
+					break
+				}
+			}
 		}
 	}
+	// fmt.Println("ticker completes it job", rf.me, rf.killed())
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -387,7 +457,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.term = 0
 	rf.votedFor = -1
 	rf.votes = make(map[int]RequestVoteReply)
-	rf.heartBeat = true
+	atomic.StoreInt32(&rf.heartBeated, 0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
