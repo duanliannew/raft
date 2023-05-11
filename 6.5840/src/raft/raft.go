@@ -173,7 +173,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	granted := args.Term > rf.term || (args.Term == rf.term && (rf.votedFor == -1 || rf.votedFor == args.From))
-	fmt.Println(time.Now(), "peer", rf.me, "current term", rf.term, "state", rf.state, "receive RequestVote from", args.From, ",term", args.Term)
+	//fmt.Println(time.Now(), "peer", rf.me, "current term", rf.term, "state", rf.state, "receive RequestVote from", args.From, ",term", args.Term)
 
 	if args.Term > rf.term {
 		rf.term = args.Term
@@ -231,7 +231,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 		rf.votes = map[int]RequestVoteReply{}
 		atomic.StoreInt32(&rf.heartBeated, 1)
-		fmt.Println(time.Now(), "Leader", args.Leader, "send heartbeat to", rf.me)
+		// fmt.Println(time.Now(), "Leader", args.Leader, "send heartbeat to", rf.me)
 		if reply != nil {
 			reply.Term = rf.term
 			reply.Success = true
@@ -293,24 +293,12 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	init := true
 OUTER:
 	for !rf.killed() {
 		// Your code here (2A)
 		rf.mu.Lock()
 		if rf.state == Candidate || rf.state == Follower {
 			rf.mu.Unlock()
-			// pause for a random amount of time between 50 and 350
-			// milliseconds. if timeout, check if there is leader and/or new term
-			// 等待 election timeout 的关键点在于:
-			// 1. 其它节点发送的心跳(term 不能过期)
-			// 2. 自己已经当选 (不应该出现这种情况，如果自己当选了，就不能在这里等超时，而是立即退出来，周期性地发送心跳)
-			// fmt.Println(time.Now(), "peer initialize", rf.me)
-			if init {
-				ms := 50 + (rand.Int63() % 300)
-				time.Sleep(time.Duration(ms) * time.Millisecond)
-				init = false
-			}
 
 			if atomic.LoadInt32(&rf.heartBeated) == 0 {
 				rf.mu.Lock()
@@ -457,7 +445,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.term = 0
 	rf.votedFor = -1
 	rf.votes = make(map[int]RequestVoteReply)
-	atomic.StoreInt32(&rf.heartBeated, 0)
+	atomic.StoreInt32(&rf.heartBeated, 1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
