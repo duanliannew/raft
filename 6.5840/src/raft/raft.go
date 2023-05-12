@@ -72,7 +72,8 @@ type Raft struct {
 	votedFor int
 	votes    map[int]RequestVoteReply
 
-	leaderAlive bool
+	leaderAlive       int32
+	leaderEstablished chan int
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -145,17 +146,13 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term int
 	From int
-	To   int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
-	// Your data here (2A).
 	Term    int
 	Granted bool
-	From    int
-	To      int
 }
 
 type AppendEntriesArgs struct {
@@ -185,8 +182,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if reply != nil {
 		reply.Term = rf.term
 		reply.Granted = granted
-		reply.From = rf.me
-		reply.To = args.From
 	}
 	rf.mu.Unlock()
 }
@@ -226,12 +221,12 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	if args.Term >= rf.term {
-		rf.term = args.Term
-		rf.state = Follower
-		rf.votedFor = -1
-		rf.votes = make(map[int]RequestVoteReply)
-		rf.leaderAlive = true
-		// fmt.Println(time.Now(), "Leader", args.Leader, "send heartbeat to", rf.me)
+		rf.switchToFollower(args.Term)
+		select {
+		case rf.leaderEstablished <- 1:
+		default:
+		}
+		// Reply success
 		if reply != nil {
 			reply.Term = rf.term
 			reply.Success = true
@@ -292,137 +287,177 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) ticker() {
-OUTER:
-	for !rf.killed() {
-		// Your code here (2A)
-		rf.mu.Lock()
-		if rf.state == Candidate || rf.state == Follower {
-			if rf.leaderAlive {
-				rf.leaderAlive = false
-				rf.mu.Unlock()
-				ms := 50 + (rand.Int63() % 300)
-				time.Sleep(time.Duration(ms) * time.Millisecond)
-			} else {
-				fmt.Printf("Peer %d switch from %d to %d with new term %d\n", rf.me, rf.state, Candidate, rf.term+1)
-				rf.state = Candidate
-				rf.term++
-				rf.votedFor = rf.me
-				rf.votes = make(map[int]RequestVoteReply)
-				rf.votes[rf.me] = RequestVoteReply{
-					Term:    rf.term,
-					Granted: true,
-					From:    rf.me,
-					To:      rf.me,
-				}
+// Wait for election timeout or leader establishes its authority
+func (rf *Raft) electionTimeout() bool {
+	ms := 50 + (rand.Int63() % 300)
+	select {
+	case <-time.After(time.Duration(ms) * time.Millisecond):
+		fmt.Printf("peer %d election timeout\n", rf.me)
+		return true
+	case <-rf.leaderEstablished:
+		atomic.StoreInt32(&rf.leaderAlive, 1)
+		return false
+	}
+}
 
-				for i := range rf.peers {
-					if _, ok := rf.votes[i]; !ok {
-						request := RequestVoteArgs{
-							Term: rf.term,
-							From: rf.me,
-							To:   i,
-						}
+func (rf *Raft) switchToCandidate() {
+	rf.state = Candidate
+	rf.term++
+	rf.votedFor = rf.me
+	rf.votes = make(map[int]RequestVoteReply)
+	fmt.Printf("peer %d switch to Candidate with new term %d\n", rf.me, rf.term)
+}
 
-						go func(s int, args *RequestVoteArgs) {
-							var reply RequestVoteReply
-							if rf.sendRequestVote(s, args, &reply) {
-								rf.mu.Lock()
-								fmt.Println("peer", rf.me, "send RequestVote to", args.To, ", term:", args.Term)
-								if reply.Term > rf.term {
-									rf.term = reply.Term
-									rf.state = Follower
-									rf.votedFor = -1
-									rf.votes = make(map[int]RequestVoteReply)
-								} else if reply.Term == rf.term {
-									rf.votes[s] = reply
-									grantedVotes := 0
-									for _, v := range rf.votes {
-										if v.Granted && v.Term == rf.term {
-											fmt.Println("grant votes from:", v.From, ",term:", v.Term, ", peers_number:", len(rf.peers))
-											grantedVotes++
-										}
-									}
-
-									if (2 * grantedVotes) > len(rf.peers) {
-										fmt.Println("peer", rf.me, "becomes leader of term", rf.term)
-										rf.state = Leader
-									}
-								}
-								rf.mu.Unlock()
-							}
-						}(i, &request)
-					}
-				}
-				rf.mu.Unlock()
-				i := 0
-				for ; i < 10; i++ {
-					rf.mu.Lock()
-					if rf.state == Leader {
-						rf.leaderAlive = true
-						rf.mu.Unlock()
-						goto OUTER
-					}
-
-					if rf.leaderAlive {
-						rf.mu.Unlock()
-						break
-					}
-
-					rf.mu.Unlock()
-					ms := 5
-					time.Sleep(time.Duration(ms) * time.Millisecond)
-				}
-				rf.mu.Lock()
-				rf.leaderAlive = false
-				rf.mu.Unlock()
-				ms := (10-int64(i))*5 + (rand.Int63() % 300)
-				time.Sleep(time.Duration(ms) * time.Millisecond)
-			}
-		} else {
-			// Send Heartbeat to other peers
-			heartBeat := AppendEntriesArgs{
-				Term:   rf.term,
-				Leader: rf.me,
-			}
-			for i := range rf.peers {
-				if i != rf.me {
-					go func(peer int, hb *AppendEntriesArgs) {
-						var heartBeatAck AppendEntriesReply
-						if rf.sendAppendEntries(peer, hb, &heartBeatAck) {
-							rf.mu.Lock()
-							if heartBeatAck.Term > rf.term {
-								rf.term = heartBeatAck.Term
-								rf.state = Follower
-							}
-							rf.mu.Unlock()
-						}
-					}(i, &heartBeat)
-				}
-			}
-			rf.mu.Unlock()
-
-			// Sleep for a while before send another heart beat to establish authority
-			follower := false
-			for i := 0; i < 5; i++ {
-				ms := 5
-				time.Sleep(time.Duration(ms) * time.Millisecond)
-				rf.mu.Lock()
-				follower = (rf.state == Follower)
-				rf.mu.Unlock()
-				if follower {
-					fmt.Println("Switch from leader to follower", rf.me)
-					rf.mu.Lock()
-					rf.leaderAlive = false
-					rf.mu.Unlock()
-					ms := (10-int64(i))*5 + (rand.Int63() % 300)
-					time.Sleep(time.Duration(ms) * time.Millisecond)
-					break
-				}
-			}
+func (rf *Raft) winElection() bool {
+	grantedVotes := 0
+	for s, v := range rf.votes {
+		if v.Granted && v.Term == rf.term {
+			grantedVotes++
+			fmt.Printf("peer %d grant votes for term %d\n", s, v.Term)
 		}
 	}
-	// fmt.Println("ticker completes it job", rf.me, rf.killed())
+
+	// If a quorum of peers grant votes, this Candidate wins the election
+	return (2 * grantedVotes) > len(rf.peers)
+}
+
+func (rf *Raft) switchToFollower(term int) {
+	rf.term = term
+	rf.state = Follower
+	rf.votedFor = -1
+	rf.votes = make(map[int]RequestVoteReply)
+	fmt.Printf("peer %d switch to Follower with term %d\n", rf.me, rf.term)
+}
+
+func (rf *Raft) switchToLeader() {
+	rf.state = Leader
+	rf.votedFor = -1
+	rf.votes = make(map[int]RequestVoteReply)
+	select {
+	case rf.leaderEstablished <- 1:
+	default:
+	}
+	fmt.Printf("peer %d switch to Leader with term %d\n", rf.me, rf.term)
+}
+
+// Wait and check if leader should send next heartbeat
+func (rf *Raft) remainInTerm() bool {
+	ms := 25
+	select {
+	case <-time.After(time.Duration(ms) * time.Millisecond):
+		return true
+	// New leader is established
+	case <-rf.leaderEstablished:
+		atomic.StoreInt32(&rf.leaderAlive, 1)
+		return false
+	}
+}
+
+// Send Request to all peers
+func (rf *Raft) broadcastRequestVote() {
+	for i := range rf.peers {
+		if _, ok := rf.votes[i]; !ok {
+			request := RequestVoteArgs{
+				Term: rf.term,
+				From: rf.me,
+			}
+
+			// Send RequestVote in parallel to boost performance and avoid Head-of-Line Blocking
+			go func(s int, args *RequestVoteArgs) {
+				var reply RequestVoteReply
+				if rf.sendRequestVote(s, args, &reply) {
+					rf.mu.Lock()
+					if reply.Term > rf.term {
+						rf.switchToFollower(reply.Term)
+					} else if reply.Term == rf.term {
+						rf.votes[s] = reply
+						if rf.winElection() {
+							rf.switchToLeader()
+						}
+					}
+					rf.mu.Unlock()
+				}
+			}(i, &request)
+		}
+	}
+}
+
+// Leader send heartbeat to all other peers to establish its authority
+func (rf *Raft) broadcastHeartbeat() {
+	heartBeat := AppendEntriesArgs{
+		Term:   rf.term,
+		Leader: rf.me,
+	}
+
+	for i := range rf.peers {
+		if i != rf.me {
+			go func(peer int, hb *AppendEntriesArgs) {
+				var heartBeatAck AppendEntriesReply
+				if rf.sendAppendEntries(peer, hb, &heartBeatAck) {
+					rf.mu.Lock()
+					if heartBeatAck.Term > rf.term {
+						rf.term = heartBeatAck.Term
+						rf.state = Follower
+						rf.votedFor = -1
+						rf.votes = make(map[int]RequestVoteReply)
+					}
+					rf.mu.Unlock()
+				}
+			}(i, &heartBeat)
+		}
+	}
+}
+
+// This ticker routine is responsible for Raft's liveness
+// 1. Follower/Candidate periodically check if a Heartbeat is received,
+//    which indicates Leader is live or someone wins election of new term
+// 2. Leader periodically send Heartbeat to establish its authority
+func (rf *Raft) ticker() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		switch rf.state {
+		case Follower:
+			if atomic.CompareAndSwapInt32(&rf.leaderAlive, 1, 0) {
+				rf.mu.Unlock()
+				// Wait for a random amount of election timeout or leader's authority is well established
+				rf.electionTimeout()
+			} else {
+				// When election timeout, peer switch to Candidate
+				rf.switchToCandidate()
+				rf.mu.Unlock()
+			}
+
+		case Candidate:
+			// Candidates vote for itself
+			rf.votes[rf.me] = RequestVoteReply{
+				Term:    rf.term,
+				Granted: true,
+			}
+
+			// Send RequestVote to all other peers
+			rf.broadcastRequestVote()
+			rf.mu.Unlock()
+
+			// If another election timeout, swith to candidate with new term
+			if rf.electionTimeout() {
+				rf.mu.Lock()
+				rf.switchToCandidate()
+				rf.mu.Unlock()
+			}
+
+		case Leader:
+			// Send Heartbeat to other peers, thus maintain its leader authority
+			rf.broadcastHeartbeat()
+			rf.mu.Unlock()
+			if !rf.remainInTerm() {
+				fmt.Printf("peer %d switch from Leader to Follower", rf.me)
+			}
+
+		default:
+			fmt.Printf("Invalid state")
+		}
+	}
+	fmt.Printf("peer %d ticker completes it job", rf.me)
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -442,14 +477,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	// Every node starts as follower, waits randomized election timeout before kicks off leader election
+	// Every node starts as follower
 	rf.state = Follower
 	rf.term = 0
 	rf.votedFor = -1
 	rf.votes = make(map[int]RequestVoteReply)
 
-	// 初始化时假设有一个 leader
-	rf.leaderAlive = true
+	// 初始化时有一个假想的 leader
+	atomic.StoreInt32(&rf.leaderAlive, 1)
+	rf.leaderEstablished = make(chan int)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
