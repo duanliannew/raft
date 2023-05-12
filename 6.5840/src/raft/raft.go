@@ -263,6 +263,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	isLeader = (rf.state == Leader)
+	rf.mu.Unlock()
 
 	return index, term, isLeader
 }
@@ -278,6 +281,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
+	close(rf.leaderEstablished)
 	// Your code here, if desired.
 	fmt.Println("Kill peer", rf.me)
 }
@@ -341,7 +345,7 @@ func (rf *Raft) switchToLeader() {
 }
 
 // Wait and check if leader should send next heartbeat
-func (rf *Raft) remainInTerm() bool {
+func (rf *Raft) maintainAuthority() bool {
 	ms := 25
 	select {
 	case <-time.After(time.Duration(ms) * time.Millisecond):
@@ -449,15 +453,15 @@ func (rf *Raft) ticker() {
 			// Send Heartbeat to other peers, thus maintain its leader authority
 			rf.broadcastHeartbeat()
 			rf.mu.Unlock()
-			if !rf.remainInTerm() {
-				fmt.Printf("peer %d switch from Leader to Follower", rf.me)
+			if !rf.maintainAuthority() {
+				fmt.Printf("peer %d switch from Leader to Follower\n", rf.me)
 			}
 
 		default:
 			fmt.Printf("Invalid state")
 		}
 	}
-	fmt.Printf("peer %d ticker completes it job", rf.me)
+	fmt.Printf("peer %d ticker completes it job\n", rf.me)
 }
 
 // the service or tester wants to create a Raft server. the ports
