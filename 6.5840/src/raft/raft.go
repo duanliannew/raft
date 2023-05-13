@@ -67,10 +67,10 @@ type Raft struct {
 	dead      int32               // set by Kill()
 
 	// Your data here (2A, 2B, 2C).
-	state    State
-	term     int
-	votedFor int
-	votes    map[int]RequestVoteReply
+	state        State
+	currentTerm  int
+	votedFor     int
+	grantedVotes map[int]RequestVoteReply
 
 	leaderAlive       int32
 	leaderEstablished chan int
@@ -87,7 +87,7 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (2A).
 	rf.mu.Lock()
-	term = rf.term
+	term = rf.currentTerm
 	isleader = (rf.state == Leader)
 	rf.mu.Unlock()
 	return term, isleader
@@ -169,18 +169,18 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
-	granted := args.Term > rf.term || (args.Term == rf.term && (rf.votedFor == -1 || rf.votedFor == args.From))
+	granted := args.Term > rf.currentTerm ||
+		(args.Term == rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == args.From))
 	//fmt.Println(time.Now(), "peer", rf.me, "current term", rf.term, "state", rf.state, "receive RequestVote from", args.From, ",term", args.Term)
 
-	if args.Term > rf.term {
-		rf.term = args.Term
-		rf.state = Follower
+	if args.Term > rf.currentTerm {
+		rf.switchToFollower(args.Term)
+		// Here must cast a vote to the Candidate
 		rf.votedFor = args.From
-		rf.votes = make(map[int]RequestVoteReply)
 	}
 
 	if reply != nil {
-		reply.Term = rf.term
+		reply.Term = rf.currentTerm
 		reply.Granted = granted
 	}
 	rf.mu.Unlock()
@@ -220,7 +220,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
-	if args.Term >= rf.term {
+	if args.Term >= rf.currentTerm {
 		rf.switchToFollower(args.Term)
 		select {
 		case rf.leaderEstablished <- 1:
@@ -228,12 +228,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// Reply success
 		if reply != nil {
-			reply.Term = rf.term
+			reply.Term = rf.currentTerm
 			reply.Success = true
 		}
 	} else {
 		if reply != nil {
-			reply.Term = rf.term
+			reply.Term = rf.currentTerm
 			reply.Success = false
 		}
 	}
@@ -306,16 +306,20 @@ func (rf *Raft) electionTimeout() bool {
 
 func (rf *Raft) switchToCandidate() {
 	rf.state = Candidate
-	rf.term++
+	rf.currentTerm++
 	rf.votedFor = rf.me
-	rf.votes = make(map[int]RequestVoteReply)
-	fmt.Printf("peer %d switch to Candidate with new term %d\n", rf.me, rf.term)
+	rf.grantedVotes = make(map[int]RequestVoteReply)
+	fmt.Printf("peer %d switch to Candidate with new term %d\n", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) winElection() bool {
 	grantedVotes := 0
-	for s, v := range rf.votes {
-		if v.Granted && v.Term == rf.term {
+	for s, v := range rf.grantedVotes {
+		if v.Granted /* && v.Term == rf.currentTerm*/ {
+			if v.Term != rf.currentTerm {
+				fmt.Errorf("something went wrong, we should not reach this point\n")
+				return false
+			}
 			grantedVotes++
 			fmt.Printf("peer %d grant votes for term %d\n", s, v.Term)
 		}
@@ -326,22 +330,22 @@ func (rf *Raft) winElection() bool {
 }
 
 func (rf *Raft) switchToFollower(term int) {
-	rf.term = term
+	rf.currentTerm = term
 	rf.state = Follower
 	rf.votedFor = -1
-	rf.votes = make(map[int]RequestVoteReply)
-	fmt.Printf("peer %d switch to Follower with term %d\n", rf.me, rf.term)
+	rf.grantedVotes = make(map[int]RequestVoteReply)
+	fmt.Printf("peer %d switch to Follower with term %d\n", rf.me, rf.currentTerm)
 }
 
 func (rf *Raft) switchToLeader() {
 	rf.state = Leader
 	rf.votedFor = -1
-	rf.votes = make(map[int]RequestVoteReply)
+	rf.grantedVotes = make(map[int]RequestVoteReply)
 	select {
 	case rf.leaderEstablished <- 1:
 	default:
 	}
-	fmt.Printf("peer %d switch to Leader with term %d\n", rf.me, rf.term)
+	fmt.Printf("peer %d switch to Leader with term %d\n", rf.me, rf.currentTerm)
 }
 
 // Wait and check if leader should send next heartbeat
@@ -360,9 +364,9 @@ func (rf *Raft) maintainAuthority() bool {
 // Send Request to all peers
 func (rf *Raft) broadcastRequestVote() {
 	for i := range rf.peers {
-		if _, ok := rf.votes[i]; !ok {
+		if _, ok := rf.grantedVotes[i]; !ok {
 			request := RequestVoteArgs{
-				Term: rf.term,
+				Term: rf.currentTerm,
 				From: rf.me,
 			}
 
@@ -371,10 +375,10 @@ func (rf *Raft) broadcastRequestVote() {
 				var reply RequestVoteReply
 				if rf.sendRequestVote(s, args, &reply) {
 					rf.mu.Lock()
-					if reply.Term > rf.term {
+					if reply.Term > rf.currentTerm {
 						rf.switchToFollower(reply.Term)
-					} else if reply.Term == rf.term {
-						rf.votes[s] = reply
+					} else if reply.Term == rf.currentTerm {
+						rf.grantedVotes[s] = reply
 						if rf.winElection() {
 							rf.switchToLeader()
 						}
@@ -389,7 +393,7 @@ func (rf *Raft) broadcastRequestVote() {
 // Leader send heartbeat to all other peers to establish its authority
 func (rf *Raft) broadcastHeartbeat() {
 	heartBeat := AppendEntriesArgs{
-		Term:   rf.term,
+		Term:   rf.currentTerm,
 		Leader: rf.me,
 	}
 
@@ -399,11 +403,8 @@ func (rf *Raft) broadcastHeartbeat() {
 				var heartBeatAck AppendEntriesReply
 				if rf.sendAppendEntries(peer, hb, &heartBeatAck) {
 					rf.mu.Lock()
-					if heartBeatAck.Term > rf.term {
-						rf.term = heartBeatAck.Term
-						rf.state = Follower
-						rf.votedFor = -1
-						rf.votes = make(map[int]RequestVoteReply)
+					if heartBeatAck.Term > rf.currentTerm {
+						rf.switchToFollower(heartBeatAck.Term)
 					}
 					rf.mu.Unlock()
 				}
@@ -433,8 +434,8 @@ func (rf *Raft) ticker() {
 
 		case Candidate:
 			// Candidates vote for itself
-			rf.votes[rf.me] = RequestVoteReply{
-				Term:    rf.term,
+			rf.grantedVotes[rf.me] = RequestVoteReply{
+				Term:    rf.currentTerm,
 				Granted: true,
 			}
 
@@ -482,10 +483,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	// Every node starts as follower
-	rf.state = Follower
-	rf.term = 0
-	rf.votedFor = -1
-	rf.votes = make(map[int]RequestVoteReply)
+	rf.switchToFollower(0)
 
 	// 初始化时有一个假想的 leader
 	atomic.StoreInt32(&rf.leaderAlive, 1)
