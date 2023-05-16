@@ -83,16 +83,17 @@ type Raft struct {
 	leaderEstablished chan int
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	newEntryMutex sync.Mutex
-	newEntryCond  *sync.Cond
-	log           []LogEntry
-	commitIndex   int
-	lastApplied   int
+	newEntryCond *sync.Cond
+	log          []LogEntry
+	commitIndex  int
+	lastApplied  int
 
 	proposerDone     chan int
 	proposeWaitGroup *sync.WaitGroup
 	nextIndex        map[int]int
 	matchIndex       map[int]int
+
+	applyCh chan<- ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -200,8 +201,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		(args.Term == rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == args.CandidateID))) &&
 		(args.LastLogTerm > logTerm || (args.LastLogTerm == logTerm && args.LastLogIndex >= logIndex))
 
-	//fmt.Println(time.Now(), "peer", rf.me, "current term", rf.term, "state", rf.state, "receive RequestVote from", args.CandidateID, ",term", args.Term)
-
 	if granted {
 		rf.switchToFollower(args.Term)
 		// Here must cast a vote to the Candidate
@@ -258,7 +257,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// Reply success
 		if reply != nil {
 			reply.Term = rf.currentTerm
-			reply.Success = true
+			// If this AppendEntries is heartbeat
+			if len(args.Entries) == 0 {
+				reply.Success = true
+			} else {
+				if (len(rf.log) < args.PrevLogIndex) ||
+					(args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
+					reply.Success = false
+				} else {
+					rf.log = append(rf.log, args.Entries...)
+					reply.Success = true
+				}
+			}
+			if reply.Success && args.LeaderCommit > rf.commitIndex {
+				// prevCommitIndex := rf.commitIndex
+				if len(rf.log) >= args.PrevLogIndex && (args.PrevLogIndex == 0 || rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm) {
+					// commitIndex is the min(args.LeaderCommit, args.PrevLogIndex)
+					rf.commitIndex = args.LeaderCommit
+					if args.PrevLogIndex < args.LeaderCommit {
+						rf.commitIndex = args.PrevLogIndex
+					}
+					// if rf.commitIndex > prevCommitIndex {
+					// 	for i := range prevCommitIndex
+					// }
+				}
+			}
 		}
 	} else {
 		if reply != nil {
@@ -291,20 +314,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (2B).
 	rf.mu.Lock()
 	isLeader = (rf.state == Leader)
 	if isLeader {
 		index = len(rf.log) + 1
 		term = rf.currentTerm
-		// rf.newEntryCond.L.Lock()
 		rf.log = append(rf.log, LogEntry{
 			Term:    term,
 			Index:   index,
 			Command: command,
 		})
 		rf.newEntryCond.Broadcast()
-		//rf.newEntryCond.L.Unlock()
 		rf.nextIndex[rf.me] = len(rf.log) + 1
 		rf.matchIndex[rf.me] = len(rf.log)
 	}
@@ -331,42 +351,49 @@ func (rf *Raft) startLogReplicate() {
 		rf.proposeWaitGroup.Add(1)
 		go func(term int, leader int, peer int, done <-chan int, wg *sync.WaitGroup) {
 			defer wg.Done()
-			fmt.Printf("term %d leader %d send command to %d\n", term, leader, peer)
+			fmt.Printf("term %d leader %d start log replication to %d\n", term, leader, peer)
 			for {
-				rf.mu.Lock()
-				if len(rf.log) >= rf.nextIndex[peer] {
-					// replicate new log entries to peer
+				select {
+				case <-done:
+					fmt.Printf("term %d leader %d stop log replication to %d\n", term, leader, peer)
+					return
+				default:
+					rf.mu.Lock()
+					if len(rf.log) >= rf.nextIndex[peer] {
+						// construct new log entries for peer
+						prevLogIndex := rf.nextIndex[peer] - 1
+						prevLogTerm := 0
+						if prevLogIndex > 0 {
+							prevLogTerm = rf.log[prevLogIndex-1].Term
+						}
+						args := &AppendEntriesArgs{
+							Term:         rf.currentTerm,
+							LeaderID:     rf.me,
+							PrevLogIndex: prevLogIndex,
+							PrevLogTerm:  prevLogTerm,
+							Entries:      rf.log[prevLogIndex:],
+							LeaderCommit: rf.commitIndex,
+						}
+						var reply AppendEntriesReply
 
-					rf.mu.Unlock()
-					// send AppendEntries rpc
-				} else {
-					rf.newEntryCond.Wait()
-					select {
-					case <-done:
-						return
-					default:
+						rf.mu.Unlock()
+						// send AppendEntries rpc
+						if rf.sendAppendEntries(peer, args, &reply) {
+							rf.mu.Lock()
+							if reply.Success {
+								rf.nextIndex[peer] += len(args.Entries)
+								rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+							} else {
+								rf.nextIndex[peer]--
+							}
+							rf.mu.Unlock()
+						}
+					} else {
+						rf.newEntryCond.Wait()
+						rf.mu.Unlock()
 					}
-					rf.mu.Unlock()
 				}
 			}
-
-			// for {
-			// 	select {
-			// 	case <-done:
-			// 		fmt.Printf("term %d leader %d stop sending command to %d\n", term, leader, peer)
-			// 		return
-			// 	default:
-			// 		rf.mu.Lock()
-			// 		rf.newEntryCond.L.Lock()
-			// 		if len(rf.log) >= rf.nextIndex[peer] {
-			// 			// replicate new log entries to peer
-			// 		} else {
-			// 			rf.newEntryCond.Wait()
-			// 			rf.newEntryCond.L.Unlock()
-			// 			rf.mu.Unlock()
-			// 		}
-			// 	}
-			// }
 		}(rf.currentTerm, rf.me, i, rf.proposerDone, rf.proposeWaitGroup)
 	}
 }
@@ -514,17 +541,23 @@ func (rf *Raft) broadcastRequestVote() {
 
 // Leader send heartbeat to all other peers to establish its authority
 func (rf *Raft) broadcastHeartbeat() {
-	heartBeat := AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderID:     rf.me,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      nil,
-		LeaderCommit: rf.commitIndex,
-	}
-
 	for i := range rf.peers {
 		if i != rf.me {
+			// construct new log entries for peer
+			prevLogIndex := rf.nextIndex[i] - 1
+			prevLogTerm := 0
+			if prevLogIndex > 0 {
+				prevLogTerm = rf.log[prevLogIndex-1].Term
+			}
+
+			heartBeat := AppendEntriesArgs{
+				Term:         rf.currentTerm,
+				LeaderID:     rf.me,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  prevLogTerm,
+				Entries:      nil,
+				LeaderCommit: rf.commitIndex,
+			}
 			go func(peer int, hb *AppendEntriesArgs) {
 				var heartBeatAck AppendEntriesReply
 				if rf.sendAppendEntries(peer, hb, &heartBeatAck) {
@@ -623,6 +656,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.proposeWaitGroup = nil
 	rf.nextIndex = make(map[int]int)
 	rf.matchIndex = make(map[int]int)
+
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
