@@ -21,6 +21,7 @@ import (
 	//	"bytes"
 	"fmt"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -265,21 +266,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					(args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 					reply.Success = false
 				} else {
-					rf.log = append(rf.log, args.Entries...)
+					if args.PrevLogIndex == 0 {
+						rf.log = args.Entries
+					} else {
+						rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+					}
 					reply.Success = true
 				}
 			}
 			if reply.Success && args.LeaderCommit > rf.commitIndex {
-				// prevCommitIndex := rf.commitIndex
+				prevCommitIndex := rf.commitIndex
 				if len(rf.log) >= args.PrevLogIndex && (args.PrevLogIndex == 0 || rf.log[args.PrevLogIndex-1].Term == args.PrevLogTerm) {
 					// commitIndex is the min(args.LeaderCommit, args.PrevLogIndex)
 					rf.commitIndex = args.LeaderCommit
 					if args.PrevLogIndex < args.LeaderCommit {
 						rf.commitIndex = args.PrevLogIndex
 					}
-					// if rf.commitIndex > prevCommitIndex {
-					// 	for i := range prevCommitIndex
-					// }
+					fmt.Printf("peer %d commit %d\n", rf.me, rf.commitIndex)
+					if rf.commitIndex > prevCommitIndex {
+						i := prevCommitIndex + 1
+						for i <= rf.commitIndex {
+							applyMsg := ApplyMsg{
+								CommandValid: true,
+								Command:      rf.log[i-1].Command,
+								CommandIndex: i,
+							}
+							fmt.Printf("peer %d apply %d, log %+v\n", rf.me, i, rf.log)
+							rf.applyCh <- applyMsg
+							rf.lastApplied = i
+							i++
+						}
+					}
 				}
 			}
 		}
@@ -312,7 +329,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
 	rf.mu.Lock()
 	isLeader = (rf.state == Leader)
@@ -327,10 +344,22 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.newEntryCond.Broadcast()
 		rf.nextIndex[rf.me] = len(rf.log) + 1
 		rf.matchIndex[rf.me] = len(rf.log)
+		// fmt.Printf("leader %d len(log) = %d, command %+v, log=%+v\n", rf.me, len(rf.log), command, rf.log)
 	}
 	rf.mu.Unlock()
 
 	return index, term, isLeader
+}
+
+func (rf *Raft) calculateCommitIndex() int {
+	matchIndex := make([]int, 0, len(rf.peers))
+	for _, v := range rf.matchIndex {
+		matchIndex = append(matchIndex, v)
+	}
+	sort.Ints(matchIndex)
+	median := (len(rf.peers) - 1) / 2
+	rf.commitIndex = matchIndex[median]
+	return rf.commitIndex
 }
 
 // After win election, leader is responsible for replicating client request
@@ -381,11 +410,38 @@ func (rf *Raft) startLogReplicate() {
 						if rf.sendAppendEntries(peer, args, &reply) {
 							rf.mu.Lock()
 							if reply.Success {
-								rf.nextIndex[peer] += len(args.Entries)
-								rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+								fmt.Printf("peer %d next index before: %d\n", peer, rf.nextIndex[peer])
+								// check if it is duplicate
+								if (args.PrevLogIndex + len(args.Entries) + 1) > rf.nextIndex[peer] {
+									rf.nextIndex[peer] = args.PrevLogIndex + len(args.Entries) + 1
+									rf.matchIndex[peer] = rf.nextIndex[peer] - 1
+								}
+
+								fmt.Printf("peer %d next index after: %d\n", peer, rf.nextIndex[peer])
+								// check if some command reaches commit point
+								prevCommitIndex := rf.commitIndex
+								if rf.calculateCommitIndex() > prevCommitIndex {
+									fmt.Printf("peer %d prev commit %d\n", rf.me, prevCommitIndex)
+									i := prevCommitIndex + 1
+									for i <= rf.commitIndex {
+										if i <= rf.lastApplied {
+											continue
+										}
+										applyMsg := ApplyMsg{
+											CommandValid: true,
+											Command:      rf.log[i-1].Command,
+											CommandIndex: i,
+										}
+										fmt.Printf("peer %d apply %d\n", rf.me, i)
+										rf.applyCh <- applyMsg
+										rf.lastApplied = i
+										i++
+									}
+								}
 							} else {
 								rf.nextIndex[peer]--
 							}
+
 							rf.mu.Unlock()
 						}
 					} else {
@@ -545,6 +601,7 @@ func (rf *Raft) broadcastHeartbeat() {
 		if i != rf.me {
 			// construct new log entries for peer
 			prevLogIndex := rf.nextIndex[i] - 1
+			fmt.Printf("leader %d peer %d prev index %d, len(log)=%d, commit=%d, matchedIndex=%+v\n", rf.me, i, prevLogIndex, len(rf.log), rf.commitIndex, rf.matchIndex)
 			prevLogTerm := 0
 			if prevLogIndex > 0 {
 				prevLogTerm = rf.log[prevLogIndex-1].Term
@@ -564,6 +621,36 @@ func (rf *Raft) broadcastHeartbeat() {
 					rf.mu.Lock()
 					if heartBeatAck.Term > rf.currentTerm {
 						rf.switchToFollower(heartBeatAck.Term)
+					} else {
+						if heartBeatAck.Success {
+							// fmt.Printf("Heartbeat: peer %d next index before: %d\n", peer, rf.nextIndex[peer])
+							// rf.nextIndex[peer] = hb.PrevLogIndex + 1
+							// rf.matchIndex[peer] = hb.PrevLogIndex
+
+							// fmt.Printf("Heartbeat: peer %d next index after: %d\n", peer, rf.nextIndex[peer])
+							// check if some command reaches commit point
+							// prevCommitIndex := rf.commitIndex
+							// if rf.calculateCommitIndex() > prevCommitIndex {
+							// 	fmt.Printf("peer %d prev commit %d\n", rf.me, prevCommitIndex)
+							// 	i := prevCommitIndex + 1
+							// 	for i <= rf.commitIndex {
+							// 		if i <= rf.lastApplied {
+							// 			continue
+							// 		}
+							// 		applyMsg := ApplyMsg{
+							// 			CommandValid: true,
+							// 			Command:      rf.log[i-1].Command,
+							// 			CommandIndex: i,
+							// 		}
+							// 		fmt.Printf("peer %d apply %d\n", rf.me, i)
+							// 		rf.applyCh <- applyMsg
+							// 		rf.lastApplied = i
+							// 		i++
+							// 	}
+							// }
+						} else {
+							// rf.nextIndex[peer]--
+						}
 					}
 					rf.mu.Unlock()
 				}
