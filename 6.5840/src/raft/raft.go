@@ -198,6 +198,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if len(rf.log) != 0 {
 		logTerm = rf.log[len(rf.log)-1].Term
 	}
+
+	if args.Term > rf.currentTerm {
+		rf.switchToFollower(args.Term)
+	}
+
 	granted := (args.Term > rf.currentTerm ||
 		(args.Term == rf.currentTerm && (rf.votedFor == -1 || rf.votedFor == args.CandidateID))) &&
 		(args.LastLogTerm > logTerm || (args.LastLogTerm == logTerm && args.LastLogIndex >= logIndex))
@@ -263,20 +268,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				(args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm) {
 				reply.Success = false
 			} else {
-				if args.PrevLogIndex == 0 {
-					rf.log = args.Entries
-				} else {
-					rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
-				}
 				reply.Success = true
+				if len(args.Entries) > 0 {
+					if args.PrevLogIndex == 0 {
+						rf.log = args.Entries
+					} else if len(args.Entries) > 0 {
+						rf.log = append(rf.log[:args.PrevLogIndex], args.Entries...)
+						fmt.Printf("peer %d len(log)=%d, prevLogIndex = %d len(entries)=%d\n",
+							rf.me, len(rf.log), args.PrevLogIndex, len(args.Entries))
+					}
+				}
 			}
 
 			if reply.Success {
 				commitIndex := args.LeaderCommit
-				if args.LeaderCommit > len(rf.log) {
-					commitIndex = len(rf.log)
+				if args.LeaderCommit > (args.PrevLogIndex + len(args.Entries)) {
+					commitIndex = (args.PrevLogIndex + len(args.Entries))
 				}
 
+				fmt.Printf("leader %d update commit index %d\npeer %d commit index %d\nlen(log)=%d final commit index %d\n",
+					args.LeaderID, args.LeaderCommit, rf.me, rf.commitIndex, len(rf.log), commitIndex)
 				if commitIndex > rf.commitIndex {
 					prevCommitIndex := rf.commitIndex
 					rf.commitIndex = commitIndex
@@ -339,7 +350,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		rf.nextIndex[rf.me] = len(rf.log) + 1
 		rf.matchIndex[rf.me] = len(rf.log)
-		// fmt.Printf("leader %d term %d up to date log=%+v\n", rf.me, rf.currentTerm, rf.log)
+		fmt.Printf("leader %d term %d up to date log=%+v\n", rf.me, rf.currentTerm, rf.log)
 		rf.newEntryCond.Broadcast()
 	}
 	rf.mu.Unlock()
@@ -354,7 +365,10 @@ func (rf *Raft) calculateCommitIndex() int {
 	}
 	sort.Ints(matchIndex)
 	median := (len(rf.peers) - 1) / 2
-	rf.commitIndex = matchIndex[median]
+	if matchIndex[median] > rf.commitIndex {
+		rf.commitIndex = matchIndex[median]
+	}
+
 	return rf.commitIndex
 }
 
@@ -372,7 +386,6 @@ func (rf *Raft) startLogReplicate() {
 		go func(term int, leader int, peer int, done <-chan int, wg *sync.WaitGroup) {
 			defer wg.Done()
 			fmt.Printf("leader %d term %d start log replication to %d\n", leader, term, peer)
-			init_sync := false
 			for {
 				select {
 				case <-done:
@@ -380,8 +393,7 @@ func (rf *Raft) startLogReplicate() {
 					return
 				default:
 					rf.mu.Lock()
-					if len(rf.log) >= rf.nextIndex[peer] || !init_sync {
-						init_sync = true
+					if len(rf.log) >= rf.nextIndex[peer] && rf.state == Leader {
 						prevLogIndex := rf.nextIndex[peer] - 1
 						prevLogTerm := 0
 						if prevLogIndex > 0 {
@@ -407,8 +419,8 @@ func (rf *Raft) startLogReplicate() {
 							}
 
 							if reply.Success {
-								fmt.Printf("leader %d replicate log to peer %d success\n", args.LeaderID, peer)
-								fmt.Printf("peer %d next index at leader %d before: %d\n", peer, args.LeaderID, rf.nextIndex[peer])
+								fmt.Printf("leader %d term %d replicate log to peer %d success\n", args.LeaderID, args.Term, peer)
+								fmt.Printf("peer %d next index at leader %d term %d before: %d\n", peer, args.LeaderID, args.Term, rf.nextIndex[peer])
 								// check if it is duplicate
 								if (args.PrevLogIndex + len(args.Entries) + 1) > rf.nextIndex[peer] {
 									rf.nextIndex[peer] = args.PrevLogIndex + len(args.Entries) + 1
@@ -511,7 +523,7 @@ func (rf *Raft) winElection() bool {
 				return false
 			}
 			grantedVotes++
-			fmt.Printf("peer %d grant votes for term %d\n", s, v.Term)
+			fmt.Printf("peer %d grant votes for candidate %d term %d\n", s, rf.me, v.Term)
 		}
 	}
 
@@ -536,7 +548,10 @@ func (rf *Raft) switchToLeader() {
 		rf.nextIndex = make(map[int]int)
 		rf.matchIndex = make(map[int]int)
 		for i := range rf.peers {
-			rf.nextIndex[i] = len(rf.log) + 1
+			rf.nextIndex[i] = 1
+			if len(rf.log) > 0 {
+				rf.nextIndex[i] = len(rf.log)
+			}
 			rf.matchIndex[i] = 0
 			if i == rf.me {
 				rf.matchIndex[i] = len(rf.log)
@@ -567,6 +582,7 @@ func (rf *Raft) maintainAuthority() bool {
 
 // Send Request to all peers
 func (rf *Raft) broadcastRequestVote() {
+	fmt.Printf("candidate %d starts leader election\n", rf.me)
 	for i := range rf.peers {
 		if _, ok := rf.grantedVotes[i]; !ok {
 			lastLogTerm := 0
@@ -580,7 +596,7 @@ func (rf *Raft) broadcastRequestVote() {
 				LastLogIndex: len(rf.log),
 				LastLogTerm:  lastLogTerm,
 			}
-			fmt.Printf("candidate %d starts leader election\n", rf.me)
+
 			// Send RequestVote in parallel to boost performance and avoid Head-of-Line Blocking
 			go func(s int, args *RequestVoteArgs) {
 				var reply RequestVoteReply
@@ -628,16 +644,6 @@ func (rf *Raft) broadcastHeartbeat() {
 					rf.mu.Lock()
 					if heartBeatAck.Term > rf.currentTerm {
 						rf.switchToFollower(heartBeatAck.Term)
-					} else {
-						if heartBeatAck.Success {
-							if (hb.PrevLogIndex + 1) > rf.nextIndex[peer] {
-								rf.nextIndex[peer] = hb.PrevLogIndex + 1
-							}
-
-							rf.matchIndex[peer] = rf.nextIndex[peer] - 1
-						} else {
-							rf.nextIndex[peer]--
-						}
 					}
 					rf.mu.Unlock()
 				}
